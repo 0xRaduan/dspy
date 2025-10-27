@@ -130,13 +130,79 @@ When your metric is used during evaluation runs, DSPy will not try to track the 
 
 But during compiling (optimization), DSPy will trace your LM calls. The trace will contain inputs/outputs to each DSPy predictor and you can leverage that to validate intermediate steps for optimization.
 
+**When is `trace` provided?**
+- `trace=None`: During standard evaluation or optimization scoring
+- `trace=[...]`: During bootstrapping (BootstrapFewShot) or when optimizers like GEPA need to inspect intermediate steps
+
+**What's in a trace?**
+
+A trace is a list of tuples, where each tuple represents one predictor call:
+```python
+trace: list[tuple[Predictor, dict[str, Any], Prediction]]
+#            └─predictor  └─inputs        └─outputs
+```
+
+**Common Use Cases:**
+
+**1. Validating intermediate steps in multi-hop reasoning**
+
+Ensure each retrieval step in a multi-hop QA system asks a different, valid query:
 
 ```python
 def validate_hops(example, pred, trace=None):
+    # Extract all search queries from intermediate predictors
     hops = [example.question] + [outputs.query for *_, outputs in trace if 'query' in outputs]
 
+    # Reject if any query is too long
     if max([len(h) for h in hops]) > 100: return False
+
+    # Reject if queries repeat (with 80% similarity threshold)
     if any(dspy.evaluate.answer_exact_match_str(hops[idx], hops[:idx], frac=0.8) for idx in range(2, len(hops))): return False
 
     return True
+```
+
+**2. Stricter filtering during bootstrapping**
+
+Return different scores based on whether you're evaluating (trace=None) or bootstrapping (trace provided):
+
+```python
+def validate_context_and_answer(example, pred, trace=None):
+    answer_match = example.answer.lower() == pred.answer.lower()
+    context_match = any((pred.answer.lower() in c) for c in pred.context)
+
+    if trace is None:  # evaluation: return partial credit
+        return (answer_match + context_match) / 2.0
+    else:  # bootstrapping: be strict, only accept perfect examples
+        return answer_match and context_match
+```
+
+This ensures BootstrapFewShot only uses the highest-quality demonstrations.
+
+**3. Providing optimizer feedback (GEPA)**
+
+Advanced optimizers like GEPA can use traces to provide targeted feedback:
+
+```python
+def metric_with_feedback(example, prediction, trace=None, pred_name=None, pred_trace=None):
+    score = int(example.answer == prediction.answer)
+
+    if score == 0:
+        feedback = f"Your answer is incorrect. The correct answer is {example.answer}."
+        return dspy.Prediction(score=0, feedback=feedback)
+
+    return dspy.Prediction(score=1, feedback="Correct!")
+```
+
+See the [GEPA tutorial](../tutorials/gepa_aime/index.ipynb) for a complete example.
+
+**4. Checking retrieval quality**
+
+Verify that your RAG system retrieved the gold-standard passages:
+
+```python
+def gold_passages_retrieved(example, pred, trace=None):
+    gold_titles = set(map(dspy.evaluate.normalize_text, example["gold_titles"]))
+    found_titles = set(map(dspy.evaluate.normalize_text, [c.split(" | ")[0] for c in pred.context]))
+    return gold_titles.issubset(found_titles)
 ```
